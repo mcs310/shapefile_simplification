@@ -1,0 +1,16 @@
+#imports
+import geopandas as geop
+
+def shapefile_laden(path):
+    try:
+        str(path)
+    except:
+        print("ungültiger input, bitte anderen input wählen")
+
+
+
+
+
+
+if __name__ == "__main__":
+    print("Hello World")

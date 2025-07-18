@@ -1,16 +1,92 @@
 #imports
 import geopandas as geop
+import numpy                    #noch drin für sqrt auch wenn diese nicht mehr gebraucht wird
+import shapely
+import os
 
-def shapefile_laden(path):
-    try:
-        str(path)
-    except:
-        print("ungültiger input, bitte anderen input wählen")
+def shapefile_laden():
+    while True:
+        try:
+            path=input("Bitte Pfad zu shapefile eintragen")
+            str(path)
+            return path
+        except:
+            print("{path} führt nicht zu einem gültigen shapefile, bitte anderen input wählen")
+
+def rasterung(form,detail,path):
+    # form: 6 für sechseck (0, 60, 120, 180, 240, 300) oder 8 für achteck (0, 45, 90, 135, 180, 225, 270, 315)
+    # detail: noch nicht genaue idee aber wird zahl die auf noch nciht näher definierte weise das bounding rectangle in ratser teilt
+    # fürs Erste min 20, max undefiniert
+    #treffen der Annahme, dass die anwendung auf mercator projektionen angewandt wird ,da die vereinfachung gemäß Koordinaten in Polnähe eigenartige Formen ergibt
+
+    shp= geop.read_file(path)
+    maxis=shp.total_bounds #extra funktion aus geopands die die maximalerte aus allen polygonen zurückgibt in form [min x, min y, max x, max y]
+    raster = []
+    y=0
+    x=0
+
+    if form==8:             #45% erfordert eine Quadratmusterung
+        while y<=maxis[3]:
+            while x<=maxis[2]:
+                raster.append(shp[y,x])
+                x=x+(maxis[0]-maxis[2])/(20+detail)
+            y=y+(maxis[1]-maxis[3])/(20+detail)
+
+    else:                   #sechseck form
+        line=0
+        while y<=maxis[3]:
+            if line % 2 == 0:
+                x = 0
+            else:
+                x = 0, 5 * (maxis[0] - maxis[2]) / (20 + detail)
+            while x<=maxis[2]:
+                raster.append(shp[y,x])
+                x = x + (maxis[0] - maxis[2]) / (20 + detail)
+            y=y+numpy.sqrt(3)*(maxis[1]-maxis[3])/(20+detail) /4   #siehe höhe sechseck
+            line+=1
+    return raster
+
+def next_p(x,y,raster):
+    abstand=[]
+    for point in raster:
+        abstand.append((x-raster[0])**2 + (y-raster[1])**2)           #wurzel fällt weg da numerischer abstand nicht relevant, nur welcher am größten ist
+    ras_index=abstand.index(min(abstand))                             #gibt mir den index des maximalen abstand und da index zwischen den beiden listen korrespondiert auch index für das nächste koordinatenpaar
+    return raster(ras_index)
+
+def snap(obj,raster):
+    außen = [next_p(x, y, raster) for x, y in obj.exterior.coords]    #annahme wir haben donuts (brandenburg), fürs erste nur EINE Landesfläche (sry Exklaven)
+
+    innen = []
+    for fl in obj.interiors:                                            #annahme mehrere löcher möglich (siehe Italien)
+        innen_kr = [next_p(x,y,raster) for x,y in fl.coords]
+        innen.append(innen_kr)
+    return  shapely.geometry.Polygon(außen,innen)
 
 
-
-
+def vereinfachen(pfad, raster):
+    shp = geop.read_file(pfad)
+    shp["geometry"]=shp["geometry"].apply(lambda poly:snap(poly,raster))
+    return shp
 
 
 if __name__ == "__main__":
     print("Hello World")
+    pfad= shapefile_laden()
+    neues_shp = vereinfachen(pfad,
+                             rasterung(
+                                 input("Bitte Form angeben. [6/8]"),
+                                 input("Bitte Detailgrad angeben. [0-100]"),
+                                 pfad)
+                             )
+
+    '''folgernder Teil entstammt frei nach Tutorial von Corey Schafer nach https://www.youtube.com/watch?v=tJxcKyFMTGo '''
+    original_dir = os.path.dirname(pfad)
+    new_folder_name = "snapped"
+    new_folder_path = os.path.join(original_dir, new_folder_name)
+    os.makedirs(new_folder_path, exist_ok=True)
+    output_shapefile_path = os.path.join(new_folder_path, "snapped.shp")
+    '''Ende des Teils gemäß Corey Schafer'''
+
+    neues_shp.to_file(output_shapefile_path )
+
+

@@ -1,8 +1,10 @@
 #imports
 import geopandas as geop
-import numpy                    #noch drin für sqrt auch wenn diese nicht mehr gebraucht wird
+import numpy
 import shapely
+from shapely.ops import unary_union
 import os
+import math
 
 def shapefile_laden():
     while True:
@@ -25,33 +27,56 @@ def rasterung(form,detail,path):
     y=0
     x=0
 
-    if form==8:             #45% erfordert eine Quadratmusterung
-        while y<=maxis[3]:
-            while x<=maxis[2]:
-                raster.append(shp[y,x])
-                x=x+(maxis[0]-maxis[2])/(20+detail)
-            y=y+(maxis[1]-maxis[3])/(20+detail)
+    if form == 8:
+        minx, miny, maxx, maxy = maxis
+        width = maxx - minx
+        height = maxy - miny
+
+        # Gemeinsame Schrittweite für quadratisches Raster
+        step = min(width, height) / (20 + detail)
+
+        y = miny
+        while y <= maxy:
+            x = minx
+            while x <= maxx:
+                raster.append([x, y])
+                x += step  # gleicher Schritt wie in y damit quadrat statt rechteck
+            y += step
 
     else:                   #sechseck form
-        line=0
-        while y<=maxis[3]:
-            if line % 2 == 0:
-                x = 0
-            else:
-                x = 0, 5 * (maxis[0] - maxis[2]) / (20 + detail)
-            while x<=maxis[2]:
-                raster.append(shp[y,x])
-                x = x + (maxis[0] - maxis[2]) / (20 + detail)
-            y=y+numpy.sqrt(3)*(maxis[1]-maxis[3])/(20+detail) /4   #siehe höhe sechseck
-            line+=1
+        minx, miny, maxx, maxy = maxis
+        width = maxx - minx
+        height = maxy - miny        #bleibt erstmal drin, auch wenn nicht länger benötigt
+
+        spacing = width / (20 + detail)
+
+        # Höhe zwischen den Zeilen
+        step_y = numpy.sqrt(3) * spacing / 2  # ~0.866 * s
+
+        y = miny
+        row = 0
+        while y <= maxy:
+            # Versatz für jede zweite Zeile
+            x_start = minx + (1.5 * spacing if row % 2 == 1 else 0)
+
+            x = x_start
+            pair = 0  # Zählt, ob wir in der 2er-Gruppe sind
+            while x <= maxx:
+                if pair < 2:
+                    raster.append([x, y])
+                # 2 Punkte, 1 Lücke → alle 3 Rasterstellen
+                pair = (pair + 1) % 3
+                x += spacing
+            y += step_y
+            row += 1
     return raster
 
 def next_p(x,y,raster):
     abstand=[]
-    for point in raster:
-        abstand.append((x-raster[0])**2 + (y-raster[1])**2)           #wurzel fällt weg da numerischer abstand nicht relevant, nur welcher am größten ist
+    for rx, ry in raster:
+        abstand.append((x - rx) ** 2 + (y - ry) ** 2)                 #wurzel fällt weg da numerischer abstand nicht relevant, nur welcher am größten ist
     ras_index=abstand.index(min(abstand))                             #gibt mir den index des maximalen abstand und da index zwischen den beiden listen korrespondiert auch index für das nächste koordinatenpaar
-    return raster(ras_index)
+    return raster[ras_index]
 
 def snap(obj,raster):
     außen = [next_p(x, y, raster) for x, y in obj.exterior.coords]    #annahme wir haben donuts (brandenburg), fürs erste nur EINE Landesfläche (sry Exklaven)
@@ -62,21 +87,180 @@ def snap(obj,raster):
         innen.append(innen_kr)
     return  shapely.geometry.Polygon(außen,innen)
 
+def snap_geometry(geom, raster_pts): #Unterteilung je nach Art
+    if geom.is_empty:   #notwendig da sonst bei einem polygon in world shapefile stockt
+        return geom
+    if geom.geom_type == "Polygon":      #standard für die meisten polygone
+        return snap(geom, raster_pts)
+    if geom.geom_type == "MultiPolygon":    #Exklaven usw
+        return shapely.geometry.MultiPolygon([snap(p, raster_pts) for p in geom.geoms])
+    return geom
 
-def vereinfachen(pfad, raster):
+def vereinfachen(pfad, raster, detail):
     shp = geop.read_file(pfad)
-    shp["geometry"]=shp["geometry"].apply(lambda poly:snap(poly,raster))
+    minx, miny, maxx, maxy = shp.total_bounds
+    width = maxx - minx
+    spacing = width / (20 + detail)
+
+    shp = preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0.2)
+
+    snapped = [snap_geometry(g, raster) for g in shp["geometry"]]
+    cleaned = [postprocess_snapped_geometry(g, spacing, tol=spacing * 1e-3, min_area_factor=0.5) for g in snapped]
+    shp["geometry"] = cleaned
     return shp
 
 
+def dist(a, b):
+    return math.hypot(a[0]-b[0], a[1]-b[1])
+
+def is_close(a, b, tol):
+    return abs(a - b) <= tol
+
+def allowed_base_dirs(spacing):     #aktuell nur für sechseck, später weiter anpassen
+    s = spacing
+    h = (math.sqrt(3)/2.0) * s
+    return [(s, 0.0), (0.5*s, h), (-0.5*s, h)]
+
+def snap_along_allowed_lines(p, q, spacing, tol):
+    dirs = allowed_base_dirs(spacing)
+    vx = q[0] - p[0]
+    vy = q[1] - p[1]
+    best = None
+    best_d = float("inf")
+    for dx, dy in dirs:
+        for sx, sy in ((dx, dy), (-dx, -dy)):
+            denom = sx*sx + sy*sy
+            if denom == 0:
+                continue
+            t = (vx*sx + vy*sy) / denom
+            n = round(t)
+            nx = p[0] + n*sx
+            ny = p[1] + n*sy
+            d = dist((nx, ny), q)
+            if d < best_d:
+                best_d = d
+                best = (nx, ny)
+    if best_d <= tol:
+        return best
+    if best_d <= 2*tol:
+        return best
+    return None
+
+def clean_ring_coords(coords, spacing, tol):
+    if len(coords) < 4:
+        return coords
+    open_coords = list(coords[:-1])
+    result = []
+    seen_index = {}
+    def push(pt):
+        if not result or (result[-1][0] != pt[0] or result[-1][1] != pt[1]):
+            result.append(pt)
+    for pt in open_coords:
+        key = (round(pt[0], 12), round(pt[1], 12))
+        if key in seen_index:
+            cut_idx = seen_index[key]
+            result = result[:cut_idx+1]
+            seen_index.clear()
+            for i, p in enumerate(result):
+                seen_index[(round(p[0],12), round(p[1],12))] = i
+        else:
+            push(pt)
+            seen_index[key] = len(result)-1
+    if len(result) >= 2:
+        fixed = [result[0]]
+        for i in range(1, len(result)):
+            p = fixed[-1]
+            q = result[i]
+            corr = snap_along_allowed_lines(p, q, spacing, tol)
+            if corr is None:
+                if dist(p, q) <= tol:
+                    continue
+                corr = snap_along_allowed_lines(p, q, spacing, 2*tol)
+                if corr is None:
+                    continue
+            fixed.append(corr)
+        result = fixed
+    if len(result) >= 3:
+        if result[0] != result[-1]:
+            result.append(result[0])
+    else:
+        return coords
+    cleaned = [result[0]]
+    for p in result[1:]:
+        if p != cleaned[-1]:
+            cleaned.append(p)
+    if len(cleaned) < 4:
+        return coords
+    return cleaned
+
+def clean_polygon(poly, spacing, tol):
+    ext = clean_ring_coords(list(poly.exterior.coords), spacing, tol)
+    ints = []
+    for r in poly.interiors:
+        cr = clean_ring_coords(list(r.coords), spacing, tol)
+        if len(cr) >= 4:
+            ints.append(cr)
+    try:
+        new_poly = shapely.geometry.Polygon(ext, ints)
+        if not new_poly.is_valid:
+            new_poly = new_poly.buffer(0)
+        return new_poly
+    except:
+        return poly
+
+def preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0.2):
+    min_area = (spacing**2) * min_area_factor
+    radius = max(spacing * buffer_factor, 1e-9)
+
+    processed = []
+    for g in shp["geometry"]:
+        if g.is_empty:
+            processed.append(g)
+            continue
+
+        if isinstance(g, shapely.geometry.Polygon):
+            if g.area < min_area:
+                processed.append(g.centroid.buffer(radius, resolution=8))
+            else:
+                processed.append(g)
+
+        elif isinstance(g, shapely.geometry.MultiPolygon):
+            parts = []
+            for p in g.geoms:
+                if p.area < min_area:
+                    parts.append(p.centroid.buffer(radius, resolution=8))
+                else:
+                    parts.append(p)
+            processed.append(shapely.ops.unary_union(parts))  # ergibt Polygon/MultiPolygon
+
+        else:
+            processed.append(g)
+
+    shp = shp.copy()
+    shp["geometry"] = processed
+    return shp
+
+def postprocess_snapped_geometry(geom, spacing, tol=1e-6, min_area_factor=0.5):
+    if geom.is_empty:
+        return geom
+    if isinstance(geom, shapely.geometry.Polygon):
+        return clean_polygon(geom, spacing, tol)
+    if isinstance(geom, shapely.geometry.MultiPolygon):
+        parts = [clean_polygon(p, spacing, tol) for p in geom.geoms]
+        return shapely.ops.unary_union(parts)
+    return geom
+
+
 if __name__ == "__main__":
-    print("Hello World")
     pfad= shapefile_laden()
+    form=int(input("Bitte Form angeben. [6/8]"))
+    detail=int(input("Bitte Detailgrad angeben. [0-100]"))
     neues_shp = vereinfachen(pfad,
                              rasterung(
-                                 input("Bitte Form angeben. [6/8]"),
-                                 input("Bitte Detailgrad angeben. [0-100]"),
-                                 pfad)
+                                 form,
+                                 detail,
+                                 pfad),
+                             detail
                              )
 
     '''folgernder Teil entstammt frei nach Tutorial von Corey Schafer nach https://www.youtube.com/watch?v=tJxcKyFMTGo '''

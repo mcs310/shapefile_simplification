@@ -24,26 +24,21 @@ def rasterung(form,detail,path):
     shp= geop.read_file(path)
     maxis=shp.total_bounds #extra funktion aus geopands die die maximalerte aus allen polygonen zurückgibt in form [min x, min y, max x, max y]
     raster = []
-    y=0
-    x=0
 
-    if form == 8:
+    if form in (4, 8):
         minx, miny, maxx, maxy = maxis
         width = maxx - minx
         height = maxy - miny
-
-        # Gemeinsame Schrittweite für quadratisches Raster
         step = min(width, height) / (20 + detail)
-
         y = miny
         while y <= maxy:
             x = minx
             while x <= maxx:
                 raster.append([x, y])
-                x += step  # gleicher Schritt wie in y damit quadrat statt rechteck
+                x += step
             y += step
 
-    else:                   #sechseck form
+    elif form==6:                   #sechseck form
         minx, miny, maxx, maxy = maxis
         width = maxx - minx
         height = maxy - miny        #bleibt erstmal drin, auch wenn nicht länger benötigt
@@ -69,6 +64,10 @@ def rasterung(form,detail,path):
                 x += spacing
             y += step_y
             row += 1
+
+    else:
+        raise ValueError("Form muss 4, 6 oder 8 sein.")     #muss kein value error sein aber dann stoppt programm immerhin mit sinnvoller message
+
     return raster
 
 def next_p(x,y,raster):
@@ -79,7 +78,7 @@ def next_p(x,y,raster):
     return raster[ras_index]
 
 def snap(obj,raster):
-    außen = [next_p(x, y, raster) for x, y in obj.exterior.coords]    #annahme wir haben donuts (brandenburg), fürs erste nur EINE Landesfläche (sry Exklaven)
+    außen = [next_p(x, y, raster) for x, y in obj.exterior.coords]    #annahme wir haben donuts (brandenburg), (fürs erste nur EINE Landesfläche (sry Exklaven)) gefixt
 
     innen = []
     for fl in obj.interiors:                                            #annahme mehrere löcher möglich (siehe Italien)
@@ -96,16 +95,17 @@ def snap_geometry(geom, raster_pts): #Unterteilung je nach Art
         return shapely.geometry.MultiPolygon([snap(p, raster_pts) for p in geom.geoms])
     return geom
 
-def vereinfachen(pfad, raster, detail):
+def vereinfachen(pfad, raster, detail, form):           #ruft nacheinander alle funktionen auf
     shp = geop.read_file(pfad)
     minx, miny, maxx, maxy = shp.total_bounds
     width = maxx - minx
     spacing = width / (20 + detail)
 
-    shp = preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0.2)
+    shp = preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0.2)       #erst zu kleine dinge entfernen
 
-    snapped = [snap_geometry(g, raster) for g in shp["geometry"]]
-    cleaned = [postprocess_snapped_geometry(g, spacing, tol=spacing * 1e-3, min_area_factor=0.5) for g in snapped]
+    snapped = [snap_geometry(g, raster) for g in shp["geometry"]]                               #einfaches closest point snappen
+    cleaned = [postprocess_snapped_geometry(g, raster, spacing, form, tol=spacing * 1e-3) for g in snapped]
+
     shp["geometry"] = cleaned
     return shp
 
@@ -116,23 +116,29 @@ def dist(a, b):
 def is_close(a, b, tol):
     return abs(a - b) <= tol
 
-def allowed_base_dirs(spacing):     #aktuell nur für sechseck, später weiter anpassen
+def allowed_base_dirs(spacing, form):
     s = spacing
-    h = (math.sqrt(3)/2.0) * s
-    return [(s, 0.0), (0.5*s, h), (-0.5*s, h)]
+    if form == 4:  # Quadrat
+        return [(s, 0.0), (0.0, s)]
+    if form == 6:  # Hex
+        h = (math.sqrt(3)/2.0) * s
+        return [(s, 0.0), (0.5*s, h), (-0.5*s, h)]
+    if form == 8:  # Quadrat + Diagonalen
+        return [(s, 0.0), (0.0, s), (s, s), (s, -s)]
+    raise ValueError("Form muss 4, 6 oder 8 sein.")
 
-def snap_along_allowed_lines(p, q, spacing, tol):
-    dirs = allowed_base_dirs(spacing)
+def snap_along_allowed_lines(p, q, spacing, tol, form):
+    dirs = allowed_base_dirs(spacing, form)
     vx = q[0] - p[0]
     vy = q[1] - p[1]
     best = None
     best_d = float("inf")
     for dx, dy in dirs:
         for sx, sy in ((dx, dy), (-dx, -dy)):
-            denom = sx*sx + sy*sy
+            denom = sx*sx + sy*sy               #einfache distanz
             if denom == 0:
                 continue
-            t = (vx*sx + vy*sy) / denom
+            t = (vx*sx + vy*sy) / denom         #erweiterte distanz
             n = round(t)
             nx = p[0] + n*sx
             ny = p[1] + n*sy
@@ -146,15 +152,60 @@ def snap_along_allowed_lines(p, q, spacing, tol):
         return best
     return None
 
-def clean_ring_coords(coords, spacing, tol):
+
+def is_valid_step(p, q, spacing, form, tol=1e-6):
+    dx = q[0] - p[0]
+    dy = q[1] - p[1]
+    dirs = allowed_base_dirs(spacing, form)
+    for vx, vy in dirs + [(-vx, -vy) for vx, vy in dirs]:
+        if math.isclose(dx, vx, abs_tol=tol) and math.isclose(dy, vy, abs_tol=tol):
+            return True
+    return False
+
+def step_towards_goal(current, goal, raster, spacing, form, tol=1e-6):
+    # nur Nachbarn aus dem Raster, die gültige Schritte sind
+    candidates = []
+    for pt in raster:
+        if is_valid_step(current, pt, spacing, form, tol):
+            candidates.append(pt)
+    if not candidates:
+        return None
+    # Kandidaten prüfen: welcher nähert sich dem Ziel am meisten an?
+    best = min(candidates, key=lambda pt: dist(pt, goal))
+    if dist(best, goal) < dist(current, goal) - tol:
+        return best
+    return None
+
+def connect_along_grid(start, goal, raster, spacing, form, tol=1e-6, max_iter=10000):
+    path = [start]
+    current = start
+    for _ in range(max_iter):
+        if dist(current, goal) <= tol:
+            path.append(goal)
+            break
+        if is_valid_step(current, goal, spacing, form, tol):
+            path.append(goal)
+            break
+        step = step_towards_goal(current, goal, raster, spacing, form, tol)
+        if step is None:
+            # kein Fortschritt möglich → Ziel direkt verbinden
+            path.append(goal)
+            break
+        path.append(step)
+        current = step
+    return path
+
+def clean_ring_coords(coords, raster, spacing, tol, form):
     if len(coords) < 4:
         return coords
-    open_coords = list(coords[:-1])
+    open_coords = list(coords[:-1])  # letztes Duplikat entfernen
     result = []
     seen_index = {}
+
     def push(pt):
         if not result or (result[-1][0] != pt[0] or result[-1][1] != pt[1]):
             result.append(pt)
+
     for pt in open_coords:
         key = (round(pt[0], 12), round(pt[1], 12))
         if key in seen_index:
@@ -166,47 +217,58 @@ def clean_ring_coords(coords, spacing, tol):
         else:
             push(pt)
             seen_index[key] = len(result)-1
+
     if len(result) >= 2:
         fixed = [result[0]]
         for i in range(1, len(result)):
             p = fixed[-1]
             q = result[i]
-            corr = snap_along_allowed_lines(p, q, spacing, tol)
-            if corr is None:
-                if dist(p, q) <= tol:
-                    continue
-                corr = snap_along_allowed_lines(p, q, spacing, 2*tol)
-                if corr is None:
-                    continue
-            fixed.append(corr)
+            segment = connect_along_grid(p, q, raster, spacing, form, tol)
+            if len(segment) > 1:
+                fixed.extend(segment[1:])
         result = fixed
+
+    # Ring explizit schließen
     if len(result) >= 3:
+        if not (math.isclose(result[0][0], result[-1][0], abs_tol=tol) and
+                math.isclose(result[0][1], result[-1][1], abs_tol=tol)):
+            close_seg = connect_along_grid(result[-1], result[0], raster, spacing, form, tol)
+            if len(close_seg) > 1:
+                result.extend(close_seg[1:])
         if result[0] != result[-1]:
             result.append(result[0])
     else:
         return coords
+
+    # Doppelpunkte entfernen
     cleaned = [result[0]]
     for p in result[1:]:
         if p != cleaned[-1]:
             cleaned.append(p)
+
     if len(cleaned) < 4:
         return coords
     return cleaned
 
-def clean_polygon(poly, spacing, tol):
-    ext = clean_ring_coords(list(poly.exterior.coords), spacing, tol)
+def clean_polygon(poly, raster, spacing, tol, form):
+    # Außenring bereinigen
+    ext = clean_ring_coords(list(poly.exterior.coords), raster, spacing, tol, form)
+
+    # Innenringe (Löcher) bereinigen
     ints = []
     for r in poly.interiors:
-        cr = clean_ring_coords(list(r.coords), spacing, tol)
-        if len(cr) >= 4:
+        cr = clean_ring_coords(list(r.coords), raster, spacing, tol, form)
+        if len(cr) >= 4:  # nur gültige Ringe behalten
             ints.append(cr)
+
     try:
         new_poly = shapely.geometry.Polygon(ext, ints)
         if not new_poly.is_valid:
-            new_poly = new_poly.buffer(0)
+            new_poly = new_poly.buffer(0)  # automatische Reparatur
         return new_poly
     except:
-        return poly
+        return poly  # Fallback, falls Reparatur fehlschlägt
+
 
 def preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0.2):
     min_area = (spacing**2) * min_area_factor
@@ -240,27 +302,26 @@ def preprocess_small_polygons(shp, spacing, min_area_factor=0.5, buffer_factor=0
     shp["geometry"] = processed
     return shp
 
-def postprocess_snapped_geometry(geom, spacing, tol=1e-6, min_area_factor=0.5):
+
+def postprocess_snapped_geometry(geom, raster, spacing, form, tol=1e-6):
     if geom.is_empty:
         return geom
     if isinstance(geom, shapely.geometry.Polygon):
-        return clean_polygon(geom, spacing, tol)
+        return clean_polygon(geom, raster, spacing, tol, form)
     if isinstance(geom, shapely.geometry.MultiPolygon):
-        parts = [clean_polygon(p, spacing, tol) for p in geom.geoms]
+        parts = [clean_polygon(p, raster, spacing, tol, form) for p in geom.geoms]
         return shapely.ops.unary_union(parts)
     return geom
 
 
 if __name__ == "__main__":
     pfad= shapefile_laden()
-    form=int(input("Bitte Form angeben. [6/8]"))
+    form=int(input("Bitte Form angeben. [4/6/8]"))
     detail=int(input("Bitte Detailgrad angeben. [0-100]"))
-    neues_shp = vereinfachen(pfad,
-                             rasterung(
-                                 form,
-                                 detail,
-                                 pfad),
-                             detail
+    neues_shp = vereinfachen(pfad,                                          #reihenfolge suckt aber zu unsauber um es zu korrigieren, funktioniert auch so
+                             rasterung(form,detail,pfad),
+                             detail,
+                             form
                              )
 
     '''folgernder Teil entstammt frei nach Tutorial von Corey Schafer nach https://www.youtube.com/watch?v=tJxcKyFMTGo '''
@@ -272,5 +333,8 @@ if __name__ == "__main__":
     '''Ende des Teils gemäß Corey Schafer'''
 
     neues_shp.to_file(output_shapefile_path )
+
+
+
 
 

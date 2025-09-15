@@ -1,5 +1,4 @@
-This repository consists of parts opf my Bachelors degree.
+This repository consists of parts of my Bachelors thesis.
 Any usage of the data is allowed.
-The work has been done without any code copied from generaitve AI.
-Should any solution be dfirectly sourced, the source itself will be put in the comments near the corresponding lines of code.
-The interface and some comments will be in German as the Bachelor Thesis itself is in German.
+Should any solution be directly sourced, the source itself will be put in the comments near the corresponding lines of code.
+The interface and some comments will be in German as the Bachelor thesis itself is in German.

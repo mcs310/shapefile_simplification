@@ -186,13 +186,13 @@ def connect_along_grid(start, goal, raster, spacing, form, tol=1e-6, max_iter=10
         if is_valid_step(current, goal, spacing, form, tol):
             path.append(goal)
             break
-        step = step_towards_goal(current, goal, raster, spacing, form, tol)
-        if step is None:
-            # kein Fortschritt möglich → Ziel direkt verbinden
-            path.append(goal)
-            break
-        path.append(step)
-        current = step
+        #step = step_towards_goal(current, goal, raster, spacing, form, tol)
+        #if step is None:
+        #    # kein Fortschritt möglich → Ziel direkt verbinden
+        #    path.append(goal)
+        #    break
+        #path.append(step)
+        #current = step
     return path
 
 def clean_ring_coords(coords, raster, spacing, tol, form):
@@ -333,8 +333,5 @@ if __name__ == "__main__":
     '''Ende des Teils gemäß Corey Schafer'''
 
     neues_shp.to_file(output_shapefile_path )
-
-
-
 
 
